@@ -43,3 +43,25 @@ plt.show()
 # 모델 저장
 joblib.dump(model, "behavior_model.pkl")
 print("모델 저장 완료: behavior_model.pkl")
+
+from sklearn.svm import SVC
+
+svm_model = SVC(kernel='rbf')
+svm_model.fit(X_train, y_train)
+y_pred_svm = svm_model.predict(X_test)
+
+print("===== SVM 결과 =====")
+print(classification_report(y_test, y_pred_svm))
+
+
+importances = model.feature_importances_
+feature_names = X.columns
+
+import matplotlib.pyplot as plt
+plt.figure(figsize=(8, 5))
+plt.barh(feature_names, importances, color='skyblue')
+plt.xlabel("Feature Importance")
+plt.title("Random Forest - Feature Importance")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
