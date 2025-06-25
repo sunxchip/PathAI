@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Int16
+
+class LaneDetect:
+    def __init__(self):
+        rospy.init_node('LaneDetectNode')
+        self.bridge = CvBridge()
+        rospy.Subscriber("/limo/color/image_raw/compressed", CompressedImage, self.callback)
+        rospy.Subscriber("/auto_trigger", Int16, self.auto_callback)
+        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        self.cmd_vel = Twist()
+        self.desired_speed = 0.6
+
+        self.auto_trigger = 0
+
+        self.src = np.float32([[80, 85], [175, 0], [470, 0], [565, 85]])
+        self.dst = np.float32([[80, 240], [80, 0], [565, 0], [565, 240]])
+        self.image_size = (640, 240)
+        self.M = cv2.getPerspectiveTransform(self.src, self.dst)
+
+    def auto_callback(self, trigger):
+        self.auto_trigger = trigger.data
+        rospy.loginfo(f"auto trigger: {self.auto_trigger}")
+
+    def callback(self, msg):
+        steering = 0.0
+
+        if msg != -1:
+            cv_img = self.bridge.compressed_imgmsg_to_cv2(msg)
+            height, width = cv_img.shape[:2]
+            roi = cv_img[height * 3 // 4:, :]
+
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            mean_brightness = np.mean(roi_gray)
+            crosswalk_brightness_threshold = 30
+
+            if mean_brightness > crosswalk_brightness_threshold:
+                steering = 0.0
+                rospy.loginfo("Bright crosswalk detected! Going straight.")
+                out_img = cv2.cvtColor(roi_gray, cv2.COLOR_GRAY2BGR)
+            else:
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                lower_white = np.array([0, 0, 130])
+                upper_white = np.array([180, 25, 255])
+                white_mask = cv2.inRange(hsv, lower_white, upper_white)
+
+                warped = cv2.warpPerspective(white_mask, self.M, self.image_size)
+                histogram = np.sum(warped[warped.shape[0] * 2 // 3:, :], axis=0)
+
+                midpoint = warped.shape[1] // 2
+                rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+                if rightx_base == midpoint:
+                    rightx_base = 640
+
+                nonzero = warped.nonzero()
+                nonzeroy = np.array(nonzero[0])
+                nonzerox = np.array(nonzero[1])
+
+                nwindows = 9
+                window_height = int(warped.shape[0] / nwindows)
+                margin = 30
+                minpix = 50
+                rightx_current = rightx_base
+                right_lane_inds = []
+
+                out_img = np.dstack((warped, warped, warped)) * 255
+
+                for window in range(nwindows):
+                    win_y_low = warped.shape[0] - (window + 1) * window_height
+                    win_y_high = warped.shape[0] - window * window_height
+                    win_xright_low = rightx_current - margin
+                    win_xright_high = rightx_current + margin
+
+                    cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
+
+                    good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                                       (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+                    right_lane_inds.append(good_right_inds)
+
+                    if len(good_right_inds) > minpix:
+                        rightx_current = int(np.mean(nonzerox[good_right_inds]))
+
+                if len(right_lane_inds) > 0:
+                    right_lane_inds = np.concatenate(right_lane_inds)
+                    out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
+
+                    rightx = nonzerox[right_lane_inds]
+                    righty = nonzeroy[right_lane_inds]
+                    right_fit = np.polyfit(righty, rightx, 2)
+
+                    y_eval = warped.shape[0] - 1
+                    right_x = right_fit[0] * y_eval ** 2 + right_fit[1] * y_eval + right_fit[2]
+
+                    lane_width = 180
+                    image_center = warped.shape[1] / 2
+
+                    right_slope = 2 * right_fit[0] * y_eval + right_fit[1]
+                    rospy.loginfo(f"Right slope: {right_slope:.4f}")
+
+                    # ✅ 코너링 강화: gain 증가
+                    if abs(right_slope) > 0.15:
+                        gain = 1.8
+                        rospy.loginfo("Applying HIGH gain for cornering")
+                    else:
+                        gain = 0.9
+                        rospy.loginfo("Applying LOW gain for straight road")
+
+                    extra_offset = 0
+                    if abs(right_slope) > 0.15:
+                        extra_offset = 40
+
+                    center_x = right_x - (lane_width + extra_offset)
+                    lateral_error = center_x - image_center
+
+                    k = 0.0025
+                    velocity = 0.35
+                    steering = gain * np.arctan2(k * lateral_error, velocity)
+
+                    cv2.line(out_img, (int(right_x), warped.shape[0]), (int(right_x), warped.shape[0] - 100), (255, 0, 0), 2)
+                    cv2.line(out_img, (int(center_x), warped.shape[0]), (int(center_x), warped.shape[0] - 100), (0, 255, 0), 2)
+                    cv2.line(out_img, (int(image_center), warped.shape[0]), (int(image_center), warped.shape[0] - 100), (0, 0, 255), 2)
+
+            if self.auto_trigger == 1:
+                self.cmd_vel.linear.x = self.desired_speed
+                self.cmd_vel.angular.z = -steering
+                self.cmd_pub.publish(self.cmd_vel)
+
+            if not rospy.is_shutdown():
+                try:
+                    cv2.imshow("ROI", roi)
+                    cv2.imshow("Sliding Window (Right Only)", out_img.astype(np.uint8))
+                    cv2.waitKey(1)
+                except cv2.error:
+                    rospy.logwarn("cv2.imshow error: likely running headless")
+
+if __name__ == '__main__':
+    try:
+        LaneDetect()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("Shutting down")
+        cv2.destroyAllWindows()

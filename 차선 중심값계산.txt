@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
+import matplotlib.pyplot as plt
+
+class LaneDetect:
+    def __init__(self):
+        rospy.init_node('LaneDetectNode')
+        self.bridge = CvBridge()
+        rospy.Subscriber("/limo/color/image_raw/compressed", CompressedImage, self.callback)
+        
+        # 이미지 크기에 따라 조절할 수 있는 예시 좌표
+        self.src = np.float32([[200, 100], [440, 100], [600, 240], [40, 240]])
+        self.dst = np.float32([[150, 0], [490, 0], [490, 240], [150, 240]])
+        self.image_size = (640, 240)
+        self.M = cv2.getPerspectiveTransform(self.src, self.dst)
+
+    def callback(self, msg):
+        if msg != -1: # 유효한 메세지인 경우
+            cv_img = self.bridge.compressed_imgmsg_to_cv2(msg)
+            height, width = cv_img.shape[:2]
+            roi = cv_img[height // 2:, :]  # 하단 절반만 추출
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+            # 노란색 범위
+            lower_yellow = np.array([15, 80, 80])
+            upper_yellow = np.array([35, 255, 255])
+            yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+            # 흰색 범위
+            lower_white = np.array([0, 0, 130])
+            upper_white = np.array([180, 25, 255])
+            white_mask = cv2.inRange(hsv, lower_white, upper_white)
+            # 두 마스크 결합
+            combined_mask = cv2.bitwise_or(yellow_mask, white_mask)
+            
+            # 시점 변환
+            warped = cv2.warpPerspective(combined_mask, self.M, self.image_size)
+                    
+            # 히스토그램 계산
+            histogram = np.sum(warped[warped.shape[0]//2:, :], axis=0)
+            # 히스토그램 기반 시작점 추정
+            midpoint = histogram.shape[0] // 2
+            leftx_base = np.argmax(histogram[:midpoint])
+            rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+            print(f"Left Base X: {leftx_base}, Right Base X: {rightx_base}")
+	        # 히스토그램 시각화
+            plt.clf()
+            plt.title("Lane Histogram")
+            plt.plot(histogram)
+            plt.axvline(leftx_base, color='r', linestyle='--')
+            plt.axvline(rightx_base, color='b', linestyle='--')
+            plt.pause(0.001)
+            
+            # nonzero 픽셀 추출
+            nonzero = warped.nonzero()
+            nonzeroy = np.array(nonzero[0])
+            nonzerox = np.array(nonzero[1])
+            # 슬라이딩 윈도우 설정
+            nwindows = 9
+            window_height = int(warped.shape[0] / nwindows)
+            margin = 50
+            minpix = 50
+
+            leftx_current = leftx_base
+            rightx_current = rightx_base
+
+            left_lane_inds = []
+            right_lane_inds = []
+
+            out_img = np.dstack((warped, warped, warped)) * 255
+
+            for window in range(nwindows):
+                win_y_low = warped.shape[0] - (window + 1) * window_height
+                win_y_high = warped.shape[0] - window * window_height
+                win_xleft_low = leftx_current - margin
+                win_xleft_high = leftx_current + margin
+                win_xright_low = rightx_current - margin
+                win_xright_high = rightx_current + margin
+
+                # 시각화용 사각형
+                cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0,255,0), 2)
+                cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0,255,0), 2)
+
+                good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                                (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+                good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                                (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+
+                left_lane_inds.append(good_left_inds)
+                right_lane_inds.append(good_right_inds)
+
+                if len(good_left_inds) > minpix:
+                    leftx_current = int(np.mean(nonzerox[good_left_inds]))
+                if len(good_right_inds) > minpix:
+                    rightx_current = int(np.mean(nonzerox[good_right_inds]))
+            
+            # 픽셀 시각화
+            left_lane_inds = np.concatenate(left_lane_inds)
+            right_lane_inds = np.concatenate(right_lane_inds)
+
+            out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 0]
+            out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 0, 255]
+            
+            # polyfit + 중심선 계산
+            if len(left_lane_inds) > 0 and len(right_lane_inds) > 0:
+                leftx = nonzerox[left_lane_inds]
+                lefty = nonzeroy[left_lane_inds]
+                rightx = nonzerox[right_lane_inds]
+                righty = nonzeroy[right_lane_inds]
+
+                left_fit = np.polyfit(lefty, leftx, 2)
+                right_fit = np.polyfit(righty, rightx, 2)
+
+                y_eval = warped.shape[0] - 1
+                left_x = left_fit[0]*y_eval**2 + left_fit[1]*y_eval + left_fit[2]
+                right_x = right_fit[0]*y_eval**2 + right_fit[1]*y_eval + right_fit[2]
+
+                lane_center = (left_x + right_x) / 2
+                image_center = warped.shape[1] / 2
+
+                # 중심선 시각화
+                cv2.line(out_img, (int(lane_center), warped.shape[0]), (int(lane_center), warped.shape[0]-50), (0, 255, 255), 2)
+                cv2.line(out_img, (int(image_center), warped.shape[0]), (int(image_center), warped.shape[0]-50), (255, 255, 255), 2)
+
+            # display
+            cv2.imshow("Sliding Window with Center", out_img.astype(np.uint8))
+	            cv2.imshow("Sliding Window Tracking", out_img.astype(np.uint8))
+            cv2.imshow("Bird's Eye View", warped)
+            cv2.imshow("Yellow Mask", yellow_mask)
+            cv2.imshow("White Mask", white_mask)
+            cv2.imshow("Combined Mask", combined_mask)
+            cv2.imshow("ROI Image", roi)
+            cv2.imshow("Raw Image", cv_img)
+            cv2.waitKey(1)
+
+if __name__ == '__main__':
+    try:
+        LaneDetect()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        print("Shutting down")
+        cv2.destroyAllWindows()

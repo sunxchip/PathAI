@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2
+import numpy as np
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
+
+class ClickPointSelector:
+    def __init__(self):
+        rospy.init_node('click_point_selector')
+        self.bridge = CvBridge()
+        self.points = []
+        self.image = None
+
+        rospy.Subscriber("/limo/color/image_raw/compressed", CompressedImage, self.callback)
+
+        # 창 생성은 콜백 밖에서 단 1번만
+        cv2.namedWindow("Image", cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback("Image", self.mouse_callback)
+
+        # ROS 타이머로 안전하게 OpenCV GUI 처리
+        rospy.Timer(rospy.Duration(0.1), self.timer_callback)
+
+    def mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.points.append((x, y))
+            print(f"Point {len(self.points)}: ({x}, {y})")
+            if len(self.points) == 4:
+                print("Final 4 points (for Perspective Transform):")
+                print(np.float32(self.points))
+                np.save("src_points.npy", np.float32(self.points))
+                rospy.signal_shutdown("4 points selected")
+
+    def callback(self, msg):
+        try:
+            self.image = self.bridge.compressed_imgmsg_to_cv2(msg)
+        except Exception as e:
+            rospy.logwarn(f"Image decode failed: {e}")
+            self.image = None
+
+    def timer_callback(self, event):
+        if self.image is not None:
+            draw = self.image.copy()
+            for p in self.points:
+                cv2.circle(draw, p, 5, (0, 255, 0), -1)
+            cv2.imshow("Image", draw)
+            cv2.waitKey(1)
+
+if __name__ == '__main__':
+    try:
+        ClickPointSelector()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        print("Shutting down")
+        cv2.destroyAllWindows()
